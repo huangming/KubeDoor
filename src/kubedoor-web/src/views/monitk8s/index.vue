@@ -1,7 +1,10 @@
+<script setup lang="ts">
+import { withPrefix } from "@/prefix/path";
+</script>
 <template>
   <iframe
     class="w-full h-full"
-    src="/grafana/d/KubeDoor-K8S/?kiosk"
+    :src="withPrefix('/grafana/d/KubeDoor-K8S/?kiosk')"
     frameborder="0"
   />
 </template>

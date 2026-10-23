@@ -9,6 +9,7 @@ from . import audit, passwords
 from .authn import AuthFailure, check_credentials
 from .context import client_ip
 from .ratelimit import limiter
+from .prefix import clear_session_cookie, set_session_cookie
 from .store import SESSION_COOKIE, hash_password, store, token_hash, verify_local
 
 _COOKIE_SECURE = os.environ.get('AUTH_COOKIE_SECURE', 'auto').strip().lower()
@@ -33,12 +34,11 @@ def _secure(request):
 
 
 def _set_cookie(response, request, token, max_age=None):
-    response.set_cookie(SESSION_COOKIE, token, max_age=max_age, path='/', httponly=True,
-                        samesite='Strict', secure=_secure(request))
+    set_session_cookie(response, request, token, max_age, _secure(request))
 
 
 def _clear_cookie(response, request):
-    response.del_cookie(SESSION_COOKIE, path='/')
+    clear_session_cookie(response, _secure(request))
 
 
 async def me_payload(principal):
