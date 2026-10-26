@@ -1,9 +1,19 @@
 import { createSseParser, type SseFrame } from "@/utils/ai";
 
+/** DeepSeek 思考强度；null 表示用模型默认（high），请求里不带参数 */
+export type AIReasoningEffort = "off" | "low" | "high" | "max";
+
 export interface AIProvider {
   base_url: string;
   api_key: string;
   model: string;
+  /** 上下文窗口（token）；null 表示由服务端按模型推断 */
+  max_input_tokens?: number | null;
+  /** 最大输出（token）；null 表示由服务端按模型推断 */
+  max_output_tokens?: number | null;
+  /** 压缩阈值（0.2–0.8，上下文达到窗口的这个比例时自动摘要）；null 表示默认 0.5 */
+  compression_ratio?: number | null;
+  reasoning_effort?: AIReasoningEffort | null;
 }
 
 export interface AIResource {
@@ -100,6 +110,18 @@ export interface AIMemoryDraft {
   content: string;
 }
 
+/** 一轮的模型用量（kubedoor_ai_runs.usage，done 事件里也会带上） */
+export interface AIUsage {
+  model_calls?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  reasoning_tokens?: number;
+  /** 主 Agent 最近一次请求的输入，即当前上下文大小 */
+  last_input_tokens?: number;
+  max_input_tokens?: number;
+}
+
 export interface AISession {
   id: string;
   title: string;
@@ -107,7 +129,11 @@ export interface AISession {
   updated_at?: string;
   messages?: AIMessage[];
   active_run?: AIRun | string | null;
+  /** 最近一轮的用量，用来显示上下文占用 */
+  usage?: AIUsage | null;
   draft?: boolean;
+  /** 搜索结果里命中的那段消息 */
+  snippet?: string;
 }
 
 export interface AIRun {
@@ -146,6 +172,12 @@ export interface WeComConfig {
   bot_id?: string;
   base_url?: string;
   model?: string;
+  max_input_tokens?: number | null;
+  max_output_tokens?: number | null;
+  compression_ratio?: number | null;
+  reasoning_effort?: AIReasoningEffort | null;
+  /** 对话空闲多少分钟后，新消息自动进入新对话；0 表示关闭 */
+  session_idle_minutes?: number;
   has_bot_secret: boolean;
   has_api_key: boolean;
   updated_by?: string;
@@ -160,6 +192,12 @@ export interface WeComUser {
   first_seen_at: string;
   last_seen_at: string;
   pending_approvals: number;
+}
+
+/** 未绑定成员的默认权限账号和默认集群 */
+export interface WeComUnbound {
+  unbound_username: string | null;
+  unbound_default_env: string | null;
 }
 
 export class AIRequestError extends Error {
@@ -267,7 +305,11 @@ export const aiApi = {
       signal
     );
   },
-  sessions: () => request<{ sessions: AISession[] }>("/sessions"),
+  /** query 非空时按标题和消息内容搜索本人的会话 */
+  sessions: (query = "") =>
+    request<{ sessions: AISession[] }>(
+      query ? `/sessions?q=${encodeURIComponent(query)}` : "/sessions"
+    ),
   createSession: (key: string, title = "新会话") =>
     request<AISession>("/sessions", "POST", { title }, key),
   session: (id: string, signal?: AbortSignal) =>
@@ -289,6 +331,8 @@ export const aiApi = {
       provider: AIProvider;
       skill_ids?: string[];
       memory_ids?: string[];
+      /** 重新生成 / 编辑后重发：替换最后一轮 */
+      replace_last?: boolean;
     },
     key: string
   ) =>
@@ -372,15 +416,27 @@ export const aiApi = {
     base_url: string;
     api_key?: string;
     model: string;
+    max_input_tokens: number | null;
+    max_output_tokens: number | null;
+    compression_ratio: number | null;
+    reasoning_effort: AIReasoningEffort | null;
+    session_idle_minutes: number;
   }) => request<WeComConfig>("/wecom", "PUT", data),
   testWecomProvider: (provider: AIProvider) =>
     request<Record<string, any>>("/wecom/test", "POST", { provider }),
-  wecomUsers: () => request<{ users: WeComUser[] }>("/wecom/users"),
+  wecomUsers: () =>
+    request<{ users: WeComUser[] } & WeComUnbound>("/wecom/users"),
   saveWecomUser: (data: {
     wecom_userid: string;
     username: string;
     default_env?: string | null;
   }) => request<{ success: boolean }>("/wecom/users", "POST", data),
+  /** 未绑定成员按 username 的权限使用机器人(null = 必须先绑定);defaultEnv 为 null 时要先切换集群才能提问 */
+  saveWecomUnbound: (username: string | null, defaultEnv: string | null) =>
+    request<WeComUnbound>("/wecom/unbound", "PUT", {
+      username,
+      default_env: defaultEnv
+    }),
   deleteWecomUser: (userid: string) =>
     request<{ success: boolean }>(`/wecom/users/${itemPath(userid)}`, "DELETE"),
   connections: () => request<{ connections: AIConnection[] }>("/connections"),

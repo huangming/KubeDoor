@@ -3,8 +3,13 @@ import { computed, nextTick, ref, watch } from "vue";
 import { useMediaQuery } from "@vueuse/core";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useAIStoreHook } from "@/store/modules/ai";
-import { formatAIStatus } from "@/utils/ai";
-import type { AIMessage, AISession, AIMemoryDraft } from "@/api/ai";
+import { CONTEXT_HINT_RATIO, contextShare, formatAIStatus } from "@/utils/ai";
+import {
+  aiApi,
+  type AIMessage,
+  type AISession,
+  type AIMemoryDraft
+} from "@/api/ai";
 import AIScopeSelector from "./AIScopeSelector.vue";
 import AIProviderDialog from "./AIProviderDialog.vue";
 import AIToolGroup from "./AIToolGroup.vue";
@@ -32,6 +37,29 @@ const selectedSession = computed(() =>
 const skillLabel = (name: string) =>
   ai.bootstrap?.skills.find(skill => (skill.id || skill.name) === name)?.name ||
   name;
+// 上下文占用 = 最近一次请求的输入 ÷ 模型窗口；较大时提示新建会话
+const contextPercent = computed(() => {
+  const share = contextShare(ai.contextUsage);
+  return share === null ? null : Math.floor(share * 100);
+});
+const contextLarge = computed(
+  () => (contextShare(ai.contextUsage) ?? 0) >= CONTEXT_HINT_RATIO
+);
+// 和模型设置里的「K token」同一单位（1K = 1024）
+const tokensText = (value = 0) =>
+  value >= 1024 ? `${Math.round(value / 1024)}K` : String(value);
+const contextTip = computed(() => {
+  const usage = ai.contextUsage;
+  if (!usage) return "";
+  const hit = usage.input_tokens
+    ? `；本轮输入命中缓存 ${Math.round(((usage.cache_read_tokens || 0) / usage.input_tokens) * 100)}%`
+    : "";
+  return (
+    `最近一次请求输入 ${tokensText(usage.last_input_tokens)} token，模型窗口 ${tokensText(usage.max_input_tokens)} token${hit}。` +
+    (contextLarge.value ? "上下文较大时回答更慢，可以新建会话重新开始；" : "") +
+    "达到压缩阈值后会自动摘要较早的对话。"
+  );
+});
 const canSend = computed(
   () =>
     !!input.value.trim() &&
@@ -210,12 +238,99 @@ async function send() {
   if (!canSend.value) return;
   await action(async () => {
     const message = input.value;
-    await ai.send(message);
+    await ai.send(message, editing.value ? { replaceLast: true } : {});
     input.value = "";
+    editing.value = false;
     followBottom.value = true;
     await scrollToBottom(true);
   });
 }
+
+// 会话搜索：按标题和消息内容，结果单独放，不打乱会话列表的刷新
+const sessionQuery = ref("");
+const searchResults = ref<AISession[] | null>(null);
+const searching = ref(false);
+let searchTimer: number | undefined;
+let searchGeneration = 0;
+watch(sessionQuery, value => {
+  window.clearTimeout(searchTimer);
+  const query = value.trim();
+  const generation = ++searchGeneration;
+  if (!query) {
+    searchResults.value = null;
+    searching.value = false;
+    return;
+  }
+  searching.value = true;
+  searchTimer = window.setTimeout(async () => {
+    try {
+      const result = await aiApi.sessions(query);
+      if (generation === searchGeneration)
+        searchResults.value = result.sessions || [];
+    } catch (reason) {
+      if (generation !== searchGeneration) return;
+      searchResults.value = [];
+      ElMessage.error(reason instanceof Error ? reason.message : "搜索失败");
+    } finally {
+      if (generation === searchGeneration) searching.value = false;
+    }
+  }, 300);
+});
+const listedSessions = computed(() => searchResults.value ?? ai.sessions);
+
+// 重新生成 / 编辑后重发：只针对最后一轮，服务端会再检查这一轮能不能替换
+const editing = ref(false);
+const lastUser = computed(() =>
+  [...ai.messages].reverse().find(item => item.role === "user")
+);
+const lastAssistant = computed(() => {
+  const last = ai.messages.at(-1);
+  return last?.role === "assistant" ? last : undefined;
+});
+const canReplace = computed(
+  () =>
+    !!lastUser.value &&
+    !!lastAssistant.value &&
+    !ai.busy &&
+    ai.sessionReady &&
+    !operating.value &&
+    ai.configured &&
+    !!ai.sessionId &&
+    !selectedSession.value?.draft
+);
+function startEdit() {
+  if (!lastUser.value) return;
+  editing.value = true;
+  input.value = lastUser.value.content;
+}
+function cancelEdit() {
+  editing.value = false;
+  input.value = "";
+}
+async function regenerate() {
+  await action(async () => {
+    await ai.regenerate();
+    followBottom.value = true;
+    await scrollToBottom(true);
+  });
+}
+watch(
+  () => ai.sessionId,
+  () => {
+    editing.value = false;
+  }
+);
+// 页面上「问 AI」带来的问题放进输入框，由用户确认后发送；对话框是懒加载的，要立即检查一次
+watch(
+  () => ai.pendingInput,
+  value => {
+    if (!value) return;
+    input.value = value;
+    editing.value = false;
+    ai.pendingInput = "";
+  },
+  { immediate: true }
+);
 function keydown(event: KeyboardEvent) {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
@@ -269,6 +384,18 @@ const timestamp = (value?: string) => {
         <span v-if="ai.bootstrap?.username" class="ai-owner">{{
           ai.bootstrap.username
         }}</span>
+        <el-tooltip
+          v-if="contextPercent !== null"
+          :content="contextTip"
+          placement="bottom"
+        >
+          <el-tag
+            size="small"
+            effect="plain"
+            :type="contextLarge ? 'warning' : 'info'"
+            >上下文 {{ contextPercent }}%</el-tag
+          >
+        </el-tooltip>
         <div class="header-actions">
           <el-button
             v-if="mobile"
@@ -318,9 +445,18 @@ const timestamp = (value?: string) => {
             @click="newSession"
             >＋ 新建会话</el-button
           >
-          <div class="session-list">
+          <el-input
+            v-model="sessionQuery"
+            class="session-search"
+            size="small"
+            clearable
+            maxlength="100"
+            placeholder="搜索标题或消息内容"
+            aria-label="搜索会话"
+          />
+          <div v-loading="searching" class="session-list">
             <button
-              v-for="session in ai.sessions"
+              v-for="session in listedSessions"
               :key="session.id"
               :class="['session-item', { active: session.id === ai.sessionId }]"
               :disabled="ai.busy || operating"
@@ -328,6 +464,9 @@ const timestamp = (value?: string) => {
               @click="selectSession(session)"
             >
               <span>{{ session.title || "新会话" }}</span>
+              <small v-if="session.snippet" class="session-snippet">{{
+                redact(session.snippet)
+              }}</small>
               <small>{{
                 session.draft
                   ? "未发送"
@@ -336,8 +475,12 @@ const timestamp = (value?: string) => {
                     : timestamp(session.updated_at || session.created_at)
               }}</small>
             </button>
-            <p v-if="!ai.sessions.length" class="sidebar-empty">
-              新建会话，开始处理集群问题。
+            <p v-if="!listedSessions.length" class="sidebar-empty">
+              {{
+                searchResults
+                  ? "没有找到相关的会话。"
+                  : "新建会话，开始处理集群问题。"
+              }}
             </p>
           </div>
           <div class="session-actions">
@@ -470,6 +613,22 @@ const timestamp = (value?: string) => {
                   @click="copy(message)"
                   >复制</el-button
                 >
+                <el-button
+                  v-if="canReplace && message === lastUser"
+                  link
+                  size="small"
+                  title="修改这条消息并重新提问，替换上一轮的回答"
+                  @click="startEdit"
+                  >编辑</el-button
+                >
+                <el-button
+                  v-if="canReplace && message === lastAssistant"
+                  link
+                  size="small"
+                  title="用同样的问题重新回答，替换这一轮"
+                  @click="regenerate"
+                  >重新生成</el-button
+                >
               </div>
               <AIMemoryAttachments
                 v-if="message.memories?.length"
@@ -519,6 +678,12 @@ const timestamp = (value?: string) => {
                 @close="ai.removeSelectedMemory(memory.id)"
                 >{{ redact(memory.title) }}</el-tag
               >
+            </div>
+            <div v-if="editing" class="edit-notice">
+              <span
+                >正在修改上一条消息：发送后替换上一轮的问答（执行过修改操作的一轮不能替换）。</span
+              >
+              <el-button link size="small" @click="cancelEdit">取消</el-button>
             </div>
             <div v-if="!ai.sessionReady" class="stream-notice">
               正在核验会话状态，可继续输入或切换；核验完成后可发送和审批。
@@ -711,6 +876,10 @@ const timestamp = (value?: string) => {
   width: 100%;
 }
 
+.session-search {
+  margin-top: 10px;
+}
+
 .session-list {
   flex: 1;
   padding: 12px 0;
@@ -741,6 +910,16 @@ const timestamp = (value?: string) => {
 .session-item small {
   font-size: 10px;
   color: var(--el-text-color-secondary);
+}
+
+.session-item .session-snippet {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.5;
+  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
 }
 
 .session-item:hover,
@@ -968,6 +1147,16 @@ const timestamp = (value?: string) => {
   margin-bottom: 8px;
   font-size: 12px;
   color: var(--el-color-warning);
+}
+
+.edit-notice {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--el-color-primary);
 }
 
 .run-notice {

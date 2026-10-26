@@ -21,11 +21,11 @@ from fastmcp import Client
 from fastmcp.client.transports import SSETransport, StreamableHttpTransport
 from langchain_core.messages import AIMessage
 
-from kubedoor_ai.domain import Identity
+from kubedoor_ai.domain import Identity, Provider
 from kubedoor_ai.gateway import RunContext
 from kubedoor_ai.http import create_app
 from kubedoor_ai.service import Service
-from fakes import ScriptedModel
+from fakes import ScriptedModel, control_state
 
 
 pytestmark = pytest.mark.skipif(not os.getenv("AI_TEST_PG_DATABASE"), reason="isolated PostgreSQL integration is opt-in")
@@ -68,6 +68,8 @@ class Harness:
             return httpx.Response(200, json={"meta": [{"name": "deployment"}, {"name": "xmx"}], "data": [["app", "512m"]]})
         if request.url.path == "/api/scale":
             return httpx.Response(200, json={"success": True, "data": {"replicas": 3}})
+        if request.url.path == "/api/ai/internal/deployment-control":
+            return httpx.Response(200, json={"success": True, "data": control_state()})
         return httpx.Response(200, json={"success": True, "data": []})
 
     def model(self, *responses):
@@ -355,5 +357,135 @@ def test_crash_recovery_keeps_dispatched_writes_unknown(harness):
         assert not any(call[1] == "/api/scale" for call in h.upstream)
         replay = await h.http.get(f"/api/ai/runs/{run['id']}/events")
         assert '"runtime_restarted"' in replay.text and '"done"' in replay.text
+
+    runner.run(verify())
+
+
+def test_wecom_conversation_boundaries_use_one_locked_transaction(harness):
+    """企微会话边界的 SQL 在真实 PostgreSQL 上执行：advisory lock、空闲切换、过期审批、继续上次。"""
+    h, runner = harness
+
+    async def verify():
+        from kubedoor_ai.wecom import WeComIntegration
+        store, wecom = h.service.store, WeComIntegration(h.service)
+        userid, identity = "wx-" + uuid.uuid4().hex, Identity(h.username, "rw")
+        await store.execute("INSERT INTO kubedoor_ai_wecom_users(wecom_userid) VALUES($1)", userid)
+        try:
+            first, notices, active = await wecom._current_session(userid, identity)
+            assert (notices, active) == ([], None)
+            row = await store.one("SELECT channel,channel_key FROM kubedoor_ai_sessions WHERE id=$1::uuid", first)
+            assert row == {"channel": "wecom", "channel_key": f"{userid}:{h.username}:{first}"}
+            assert (await wecom._current_session(userid, identity))[0] == first
+            await store.execute("INSERT INTO kubedoor_ai_messages(id,session_id,role,content) VALUES($1::uuid,$2::uuid,'user','查询 Pod')",
+                                str(uuid.uuid4()), first)
+
+            # 空闲 3 小时后三条消息同时到达：只建一个新对话，只有一条带提示
+            await store.execute("UPDATE kubedoor_ai_sessions SET updated_at=now()-interval '3 hours' WHERE id=$1::uuid", first)
+            results = await asyncio.gather(*(wecom._current_session(userid, identity) for _ in range(3)))
+            second = results[0][0]
+            assert second != first and {r[0] for r in results} == {second}
+            assert sum(bool(r[1]) for r in results) == 1
+            member = await store.one("SELECT session_id,previous_session_id FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid)
+            assert member == {"session_id": second, "previous_session_id": first}
+
+            # 继续上次：切回并刷新最后活跃时间，紧接着的消息不会被空闲切走
+            assert (await wecom._resume_previous_session(userid, identity)).startswith("已回到上一个对话（最后活跃：")
+            assert await wecom._current_session(userid, identity) == (first, [], None)
+
+            # 只剩过期审批的任务先被停止
+            run_id = str(uuid.uuid4())
+            await store.execute("INSERT INTO kubedoor_ai_runs(id,session_id,username,permission,status,scope,origin) "
+                                "VALUES($1::uuid,$2::uuid,$3,'rw','waiting_approval',$4,'wecom')", run_id, first, h.username, {"env": "cluster-a"})
+            await store.execute("INSERT INTO kubedoor_ai_actions(id,run_id,call_id,operation,source,arguments,preview,read_only,state,expires_at) "
+                                "VALUES($1::uuid,$2::uuid,$3,'delete_pod','kubedoor','{}','{}',false,'pending',now()-interval '1 minute')",
+                                str(uuid.uuid4()), run_id, run_id + ":expired")
+            session_id, notices, active = await wecom._current_session(userid, identity)
+            assert (session_id, notices, active) == (first, ["上一个待审批的操作已过期，已停止该任务。"], None)
+            assert (await store.one("SELECT status FROM kubedoor_ai_runs WHERE id=$1::uuid", run_id))["status"] == "cancelled"
+
+            # 新对话：当前对话记为上一个
+            assert await wecom._start_new_session(userid, identity) == "已开始新对话。"
+            member = await store.one("SELECT session_id,previous_session_id FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid)
+            assert member["previous_session_id"] == first and member["session_id"] not in (first, second)
+        finally:
+            await store.execute("DELETE FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid)
+
+    runner.run(verify())
+
+
+def test_unreachable_old_wecom_conversation_loses_its_checkpoint_but_keeps_messages(harness):
+    h, runner = harness
+
+    async def verify():
+        from kubedoor_ai.wecom import WeComIntegration
+        store, wecom, checkpointer = h.service.store, WeComIntegration(h.service), h.service.runtime.checkpointer
+        userid, identity = "wx-" + uuid.uuid4().hex, Identity(h.username, "rw")
+        await store.execute("INSERT INTO kubedoor_ai_wecom_users(wecom_userid) VALUES($1)", userid)
+        try:
+            old, _, _ = await wecom._current_session(userid, identity)
+            h.model(AIMessage(content="查过了，一切正常"))
+            run, _ = await h.service.new_run(identity, old, {"env": "cluster-a"}, origin="wecom", channel="wecom")
+            await store.message(run, "user", "查一下")
+            await h.service.runtime.run_graph(RunContext(run, identity), Provider.parse(PROVIDER), "查一下", None)
+            assert await checkpointer.aget_tuple({"configurable": {"thread_id": old}}) is not None
+            # 两次「新对话」（中间那个对话有消息）之后，old 既不是当前对话也不是上一个对话
+            await wecom._start_new_session(userid, identity)
+            middle = (await store.one("SELECT session_id FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid))["session_id"]
+            await store.execute("INSERT INTO kubedoor_ai_messages(id,session_id,role,content) VALUES($1::uuid,$2::uuid,'user','再问一句')",
+                                str(uuid.uuid4()), middle)
+            await wecom._start_new_session(userid, identity)
+            await store.execute("UPDATE kubedoor_ai_sessions SET updated_at=now()-interval '8 days' WHERE id=ANY($1::uuid[])", [old, middle])
+            assert await wecom.purge_checkpoints(7) >= 1
+            assert await checkpointer.aget_tuple({"configurable": {"thread_id": old}}) is None
+            row = await store.one("SELECT checkpoint_purged_at,(SELECT count(*) FROM kubedoor_ai_messages m WHERE m.session_id=s.id) AS messages "
+                                  "FROM kubedoor_ai_sessions s WHERE id=$1::uuid", old)
+            assert row["checkpoint_purged_at"] and row["messages"] == 2   # 消息记录保留用于审计
+            # 上一个对话（middle）还能「继续上次」，不清理；旧卡片切不回已清理的 old
+            assert (await store.one("SELECT checkpoint_purged_at FROM kubedoor_ai_sessions WHERE id=$1::uuid", middle))["checkpoint_purged_at"] is None
+            assert await wecom._continue_session(userid, identity, old) == "该对话已不可用，直接发送问题即可开始新对话。"
+        finally:
+            await store.execute("DELETE FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid)
+
+    runner.run(verify())
+
+
+def test_regenerate_and_edit_replace_only_a_safe_last_turn_and_search_finds_sessions(harness):
+    h, runner = harness
+
+    async def verify():
+        sid = await h.session()
+        h.model(AIMessage(content="第一轮回答"), AIMessage(content="第二轮旧回答"), AIMessage(content="第二轮新回答"))
+        for text in ("order-api 为什么重启", "继续看看内存"):
+            response = await h.http.post(f"/api/ai/sessions/{sid}/runs", json={"message": text, "scope": {"env": "cluster-a"}, "provider": PROVIDER})
+            await h.wait(response.json()["run_id"])
+        edit = {"message": "继续看看内存（换个问法）", "scope": {"env": "cluster-a"}, "provider": PROVIDER, "replace_last": True}
+        response = await h.http.post(f"/api/ai/sessions/{sid}/runs", json=edit, headers={"Idempotency-Key": "edit-1"})
+        assert response.status_code == 200, response.text
+        replacement = response.json()["run_id"]
+        await h.wait(replacement)
+        # 同一个幂等键重试返回同一个 run，不会被自己刚建的 run 挡住
+        again = await h.http.post(f"/api/ai/sessions/{sid}/runs", json=edit, headers={"Idempotency-Key": "edit-1"})
+        assert again.status_code == 200 and again.json()["run_id"] == replacement
+        detail = (await h.http.get(f"/api/ai/sessions/{sid}")).json()
+        assert [m["content"] for m in detail["messages"]] == ["order-api 为什么重启", "第一轮回答", "继续看看内存（换个问法）", "第二轮新回答"]
+        replaced = await h.service.store.fetch("SELECT content FROM kubedoor_ai_messages WHERE session_id=$1::uuid AND replaced_at IS NOT NULL ORDER BY created_at", sid)
+        assert [row["content"] for row in replaced] == ["继续看看内存", "第二轮旧回答"]   # 保留用于追溯
+        # 检查点里也只剩第一轮和替换后的第二轮
+        probe = RunContext({"id": "probe", "session_id": sid, "scope": {"env": "cluster-a", "namespace": None, "deployment": None, "pod": None}, "skill_ids": []}, Identity(h.username, "rw"))
+        state = await h.service.runtime.graph(probe, Provider.parse(PROVIDER)).aget_state({"configurable": {"thread_id": sid}})
+        contents = " ".join(str(message.content) for message in state.values["messages"])
+        assert "第二轮新回答" in contents and "第二轮旧回答" not in contents and contents.count("继续看看内存") == 1
+        # 搜索标题和消息内容，不分大小写；% 按字面匹配；被替换的旧消息搜不到
+        found = (await h.http.get("/api/ai/sessions", params={"q": "ORDER-API"})).json()["sessions"]
+        assert [row["id"] for row in found] == [sid] and "order-api 为什么重启" in found[0]["snippet"]
+        assert (await h.http.get("/api/ai/sessions", params={"q": "100%"})).json()["sessions"] == []
+        assert (await h.http.get("/api/ai/sessions", params={"q": "第二轮旧回答"})).json()["sessions"] == []
+        # 最后一轮执行过修改就不能再替换（结果未知的也不行）
+        await h.service.store.execute(
+            "INSERT INTO kubedoor_ai_actions(id,run_id,call_id,operation,source,arguments,preview,read_only,state,result) "
+            "VALUES($1::uuid,$2::uuid,$3,'scale_deployment','kubedoor','{}','{}',false,'failed',$4)",
+            str(uuid.uuid4()), replacement, "call-" + uuid.uuid4().hex, {"success": False, "error": {"code": "partial_failure"}})
+        denied = await h.http.post(f"/api/ai/sessions/{sid}/runs", json=edit)
+        assert denied.status_code == 409 and denied.json()["error"]["code"] == "turn_has_writes"
 
     runner.run(verify())

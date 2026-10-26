@@ -107,7 +107,11 @@ def create_app(service=None, token=None):
                     result = await svc.store.one("INSERT INTO kubedoor_ai_connections(env,encrypted_config,context,updated_by) VALUES($1,$2,$3,$4) ON CONFLICT(env) DO UPDATE SET encrypted_config=EXCLUDED.encrypted_config,context=EXCLUDED.context,revision=kubedoor_ai_connections.revision+1,test_status='success',tested_at=now(),updated_by=EXCLUDED.updated_by,updated_at=now() RETURNING env,context,revision,test_status,tested_at", env, encrypted, context, identity.username)
             elif endpoint == "sessions":
                 if request.method == "GET":
-                    result = {"sessions": await svc.store.fetch("SELECT id,title,created_at,updated_at FROM kubedoor_ai_sessions WHERE username=$1 AND channel='web' ORDER BY updated_at DESC", identity.username)}
+                    text = (request.query_params.get("q") or "").strip()[:100]
+                    if text:
+                        result = {"sessions": await svc.search_sessions(identity, text)}
+                    else:
+                        result = {"sessions": await svc.store.fetch("SELECT id,title,created_at,updated_at FROM kubedoor_ai_sessions WHERE username=$1 AND channel='web' ORDER BY updated_at DESC", identity.username)}
                 else:
                     data = await body(request)
                     result = await svc.new_session(identity, data.get("title", "新会话"), request.headers.get("idempotency-key"))
@@ -153,9 +157,18 @@ def create_app(service=None, token=None):
                 if not isinstance(message, str) or not message.strip() or len(message) > 100000:
                     raise AIError("消息不能为空，最多 100000 字符")
                 provider = Provider.parse(data.get("provider"))
-                run, created = await svc.new_run(identity, sid, data.get("scope"), skill_ids=data.get("skill_ids"), key=request.headers.get("idempotency-key"), memory_ids=data.get("memory_ids"))
+                key = request.headers.get("idempotency-key")
+                # 重新生成 / 编辑后重发：替换最后一轮。同一个幂等键重试时 run 已经建好，不再重复检查
+                rewind = None
+                if data.get("replace_last") is True and not (key and await svc.store.one(
+                        "SELECT id FROM kubedoor_ai_runs WHERE session_id=$1::uuid AND idempotency_key=$2", sid, key)):
+                    rewind = await svc.replaceable_turn(identity, sid)
+                run, created = await svc.new_run(identity, sid, data.get("scope"), skill_ids=data.get("skill_ids"), key=key, memory_ids=data.get("memory_ids"))
                 saved_message = None
                 if created:
+                    if rewind:
+                        await svc.store.execute("UPDATE kubedoor_ai_messages SET replaced_at=now() WHERE session_id=$1::uuid AND run_id=$2::uuid AND replaced_at IS NULL", sid, rewind)
+                        run["_rewind"] = rewind
                     clean_message = redact(message.strip(), (provider.api_key,))
                     memories = redact(run.get("_memories", []), (provider.api_key,))
                     if memories:
@@ -217,9 +230,13 @@ def create_app(service=None, token=None):
             elif endpoint == "wecom-users":
                 identity.require_admin()
                 if request.method == "GET":
-                    result = {"users": await request.app.state.wecom.users()}
+                    result = {"users": await request.app.state.wecom.users(),
+                              **await request.app.state.wecom.unbound_setting()}
                 else:
                     result = await request.app.state.wecom.save_user(identity, await body(request))
+            elif endpoint == "wecom-unbound":
+                identity.require_admin()
+                result = await request.app.state.wecom.save_unbound(identity, await body(request))
             elif endpoint == "wecom-user":
                 identity.require_admin()
                 await request.app.state.wecom.delete_user(request.path_params["userid"])
@@ -276,6 +293,7 @@ def create_app(service=None, token=None):
     route("/wecom", "wecom-config", ["GET", "PUT"])
     route("/wecom/test", "wecom-test", ["POST"])
     route("/wecom/users", "wecom-users", ["GET", "POST"])
+    route("/wecom/unbound", "wecom-unbound", ["PUT"])
     route("/wecom/users/{userid}", "wecom-user", ["DELETE"])
     route("/skills", "skills", ["GET"])
     route("/skills/{skill_id}", "skill", ["GET"])

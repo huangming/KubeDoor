@@ -20,7 +20,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import Field
 
-from fakes import FakeStore, ScriptedModel
+from fakes import FakeStore, ScriptedModel, stub_control
 from kubedoor_ai.domain import CredentialCipher, Identity, Provider
 from kubedoor_ai.gateway import Gateway, RunContext
 from kubedoor_ai.http import create_app
@@ -183,6 +183,7 @@ async def h():
     store = ConversationStore()
     gateway = Gateway(store, CredentialCipher("ab" * 32), "http://unused-master", "test-token")
     gateway.execute_action = AsyncMock(return_value={"success": True, "data": {"replicas": 2}})
+    stub_control(gateway)
     model = RecordingModel(responses=[AIMessage(content="测试回复，未访问集群。")])
     runtime = Runtime(store, gateway, InMemorySaver(), model_factory=lambda _: model)
     service = Service(store, gateway, runtime)
@@ -225,7 +226,8 @@ async def send(h, sid, message, memory_ids=None, username="alice", permission="r
 
 
 def user_messages(messages):
-    return [str(message.content) for message in messages if isinstance(message, HumanMessage)]
+    # 用户正文前面是平台注入的本轮上下文块（runtime.build_turn_context），这里只比较正文
+    return [str(message.content).split("</kubedoor_turn_context>\n\n", 1)[-1] for message in messages if isinstance(message, HumanMessage)]
 
 
 @pytest.mark.asyncio

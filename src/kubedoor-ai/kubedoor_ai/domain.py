@@ -100,6 +100,10 @@ class Provider:
     base_url: str
     api_key: str
     model: str
+    max_input_tokens: int | None = None     # 用户填写的上下文窗口；None 表示按模型推断
+    max_output_tokens: int | None = None    # 用户填写的最大输出；None 表示按模型推断
+    compression_ratio: float | None = None  # 压缩阈值（0.2–0.8）；None 表示默认 0.5
+    reasoning_effort: str | None = None     # DeepSeek 思考强度 off/low/high/max；None 表示用模型默认（high）
 
     @classmethod
     def parse(cls, raw: dict) -> "Provider":
@@ -113,7 +117,29 @@ class Provider:
             raise AIError("API key 必须为字符串，最多 8192 字符")
         if not isinstance(model, str) or not model.strip() or len(model) > 256:
             raise AIError("模型名不能为空")
-        return cls(base_url, key, model.strip())
+        return cls(base_url, key, model.strip(), *parse_model_limits(raw), parse_reasoning_effort(raw))
+
+
+REASONING_EFFORTS = ("off", "low", "high", "max")
+
+
+def parse_reasoning_effort(raw: Mapping) -> str | None:
+    effort = raw.get("reasoning_effort")
+    if effort is not None and effort not in REASONING_EFFORTS:
+        raise AIError("思考强度只能是 off、low、high、max")
+    return effort
+
+
+def parse_model_limits(raw: Mapping) -> tuple[int | None, int | None, float | None]:
+    """校验可选的上下文窗口、最大输出和压缩阈值；不填的项返回 None，由后端按模型推断。"""
+    max_input, max_output, ratio = (raw.get(key) for key in ("max_input_tokens", "max_output_tokens", "compression_ratio"))
+    if max_input is not None and (type(max_input) is not int or not 4096 <= max_input <= 10_000_000):
+        raise AIError("上下文窗口必须为 4096–10000000 之间的整数（token）")
+    if max_output is not None and (type(max_output) is not int or not 1024 <= max_output <= (max_input or 10_000_000)):
+        raise AIError("最大输出必须为 1024 到上下文窗口之间的整数（token）")
+    if ratio is not None and (type(ratio) not in (int, float) or not 0.2 <= ratio <= 0.8):
+        raise AIError("压缩阈值必须在 20%–80% 之间")
+    return max_input, max_output, None if ratio is None else float(ratio)
 
 
 def normalize_provider_url(raw: Any) -> str:

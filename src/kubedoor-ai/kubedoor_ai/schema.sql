@@ -14,6 +14,8 @@ ALTER TABLE kubedoor_ai_sessions ADD COLUMN IF NOT EXISTS channel text NOT NULL 
 ALTER TABLE kubedoor_ai_sessions ADD COLUMN IF NOT EXISTS channel_key text;
 CREATE INDEX IF NOT EXISTS kubedoor_ai_sessions_channel ON kubedoor_ai_sessions(channel, updated_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS kubedoor_ai_sessions_channel_key ON kubedoor_ai_sessions(channel, channel_key) WHERE channel_key IS NOT NULL;
+-- 已删除 LangGraph 检查点的时间(企微里再也不会继续的旧对话,wecom.py 定期清理);会话和消息记录保留,不能再继续
+ALTER TABLE kubedoor_ai_sessions ADD COLUMN IF NOT EXISTS checkpoint_purged_at timestamptz;
 CREATE TABLE IF NOT EXISTS kubedoor_ai_runs (
     id uuid PRIMARY KEY, session_id uuid NOT NULL REFERENCES kubedoor_ai_sessions(id) ON DELETE CASCADE,
     username text NOT NULL, permission text NOT NULL, status text NOT NULL,
@@ -25,12 +27,18 @@ CREATE TABLE IF NOT EXISTS kubedoor_ai_runs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS kubedoor_ai_one_active_run ON kubedoor_ai_runs(session_id)
     WHERE status IN ('running', 'waiting_approval');
+-- 本轮模型用量（runtime.UsageMiddleware）：调用次数、输入/输出/缓存命中/推理 token、最近一次输入和模型窗口
+ALTER TABLE kubedoor_ai_runs ADD COLUMN IF NOT EXISTS usage jsonb;
+-- 这一轮的用户消息在检查点里的 id 是 user-<run id>，重新生成 / 编辑后重发靠它找到要删掉的那一轮；之前的旧 run 没有
+ALTER TABLE kubedoor_ai_runs ADD COLUMN IF NOT EXISTS rewindable boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS kubedoor_ai_messages (
     id uuid PRIMARY KEY, session_id uuid NOT NULL REFERENCES kubedoor_ai_sessions(id) ON DELETE CASCADE,
     run_id uuid REFERENCES kubedoor_ai_runs(id) ON DELETE SET NULL,
     role text NOT NULL, content text NOT NULL, scope jsonb, tools jsonb,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+-- 被重新生成 / 编辑后重发替换掉的那一轮消息：保留用于追溯，不再显示
+ALTER TABLE kubedoor_ai_messages ADD COLUMN IF NOT EXISTS replaced_at timestamptz;
 CREATE TABLE IF NOT EXISTS kubedoor_ai_events (
     run_id uuid NOT NULL REFERENCES kubedoor_ai_runs(id) ON DELETE CASCADE,
     seq bigint NOT NULL, type text NOT NULL, data jsonb NOT NULL,
@@ -68,6 +76,15 @@ CREATE TABLE IF NOT EXISTS kubedoor_ai_wecom_config (
     updated_by text NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+-- 未绑定的企微成员按这个花折账号的权限使用机器人;为空时必须先绑定
+ALTER TABLE kubedoor_ai_wecom_config ADD COLUMN IF NOT EXISTS unbound_username text
+    CHECK (unbound_username IS NULL OR char_length(unbound_username) BETWEEN 1 AND 200);
+-- 未绑定成员的默认集群;为空 = 「无」,成员要先切换集群才能提问
+ALTER TABLE kubedoor_ai_wecom_config ADD COLUMN IF NOT EXISTS unbound_default_env text
+    CHECK (unbound_default_env IS NULL OR char_length(unbound_default_env) BETWEEN 1 AND 255);
+-- 企微对话空闲多少分钟后，新消息自动进入新对话;0 = 关闭
+ALTER TABLE kubedoor_ai_wecom_config ADD COLUMN IF NOT EXISTS session_idle_minutes integer NOT NULL DEFAULT 120
+    CHECK (session_idle_minutes BETWEEN 0 AND 10080);
 CREATE TABLE IF NOT EXISTS kubedoor_ai_wecom_users (
     wecom_userid text PRIMARY KEY,
     username text,
@@ -81,6 +98,9 @@ CREATE TABLE IF NOT EXISTS kubedoor_ai_wecom_users (
     CHECK (username IS NULL OR char_length(username) BETWEEN 1 AND 200)
 );
 CREATE INDEX IF NOT EXISTS kubedoor_ai_wecom_users_username ON kubedoor_ai_wecom_users(username);
+-- session_id 是成员的当前对话;previous_session_id 是上一个对话,「继续上次」切回去
+ALTER TABLE kubedoor_ai_wecom_users ADD COLUMN IF NOT EXISTS previous_session_id uuid
+    REFERENCES kubedoor_ai_sessions(id) ON DELETE SET NULL;
 CREATE TABLE IF NOT EXISTS kubedoor_ai_wecom_inbox (
     msgid text PRIMARY KEY,
     wecom_userid text NOT NULL,

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 import pytest_asyncio
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import Field
 
@@ -128,6 +128,18 @@ class RecordingModel(ScriptedModel):
         return super()._generate(messages, stop, run_manager, **kwargs)
 
 
+def prompts(messages):
+    """系统提示和当轮用户消息开头的本轮上下文块"""
+    system = "\n".join(text_content(message) for message in messages if isinstance(message, SystemMessage))
+    user = [text_content(message) for message in messages if isinstance(message, HumanMessage)][-1]
+    assert user.startswith("<kubedoor_turn_context>\n")
+    return system, user.split("</kubedoor_turn_context>", 1)[0]
+
+
+def turn_line(block, label):
+    return block.split("\n" + label, 1)[1].split("\n", 1)[0]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("selected", [
     {"env": "cluster-a"},
@@ -147,16 +159,36 @@ async def test_actual_model_receives_only_selected_scope_without_menu_option_lis
     try:
         await runtime.run_graph(ctx, Provider("http://unused-model/v1", "", "mock-model"), "查询当前集群", None)
         assert store.statuses[-1] == "completed"
-        prompt = "\n".join(text_content(message) for message in model.histories[0] if isinstance(message, SystemMessage))
-        encoded_scope = prompt.split("当前范围（本轮固定）：", 1)[1].split("\n", 1)[0]
-        assert json.loads(encoded_scope) == selected
+        system, block = prompts(model.histories[0])
+        assert json.loads(turn_line(block, "本轮范围：")) == selected
         assert ctx.run["scope"] == original
         for name in UI_ONLY_NAMES:
-            assert name not in prompt
-        assert "当前北京时间（Asia/Shanghai）：" in prompt
-        assert "定时与周期任务的 run_at、Cron 均按北京时间" in prompt
+            assert name not in system and name not in block
+        assert "北京时间：" in block and "北京时间：" not in system
+        assert "定时与周期任务的 run_at、Cron 均按北京时间" in block
         for entry in tool_catalog():
-            assert entry["name"] in prompt
+            assert entry["name"] in system
+    finally:
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin, hinted", [("wecom", True), ("chat", False)])
+async def test_wecom_runs_tell_the_model_how_to_switch_clusters(origin, hinted):
+    store = FakeStore()
+    gateway = Gateway(store, CredentialCipher("ab" * 32), "http://unused-master", "test-token")
+    model = RecordingModel(responses=[AIMessage(content="当前只能查看 cluster-a。")])
+    runtime = Runtime(store, gateway, InMemorySaver(), model_factory=lambda _: model)
+    scope = {"env": "cluster-a", "namespace": None, "deployment": None, "pod": None}
+    ctx = RunContext({"id": "run-1", "session_id": "session-1", "origin": origin, "scope": scope, "skill_ids": []},
+                     Identity("operator", "read"))
+    try:
+        await runtime.run_graph(ctx, Provider("http://unused-model/v1", "", "mock-model"), "查一下别的集群", None)
+        system, block = prompts(model.histories[0])
+        # 渠道提示在本轮上下文块里，系统提示对网页和企微完全相同
+        assert ("切换集群" in turn_line(block, "对话渠道：")) is hinted
+        assert "切换集群" not in system
+        assert json.loads(turn_line(block, "本轮范围：")) == {"env": "cluster-a"}
     finally:
         await gateway.close()
 
