@@ -29,6 +29,10 @@ npm run build
 本地开发时 `/api` 按 `vite.config.ts` 的 `server.proxy` 转发（默认 `http://127.0.0.1:8080`），
 可以先执行 `kubectl -n kubedoor port-forward svc/kubedoor-web 8080:80` 指向一套已部署的 KubeDoor。
 
+## `/kubedoor/` 入口
+
+原来的 `/` 保持不变，同一份页面也可以从 `/kubedoor/` 打开，方便前置 nginx 只反代这一条路径。新增跳转、iframe、Web nginx 或会话 Cookie 时，先看 [src/prefix/README.md](src/prefix/README.md)。
+
 ## 登录页
 
 `src/views/login/`：水墨月洞门背景 + 毛玻璃登录框，登录框放在月洞门的门洞里。
