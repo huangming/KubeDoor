@@ -13,6 +13,72 @@
     <script>
       window.process = {};
     </script>
+    <!--
+      必须写在模块之前。页面里的 xhook 会先拿走原生 XMLHttpRequest/fetch，
+      之后再改 prototype 已经影响不到真正发出去的请求。
+      页面在 /kubedoor/ 下时，接口、WebSocket 都要带上这个前缀，前置 nginx 才能转发。
+    -->
+    <script>
+      (function () {
+        var PREFIX = "/kubedoor";
+        function currentPrefix() {
+          var path = location.pathname || "";
+          if (path === PREFIX || path.indexOf(PREFIX + "/") === 0) return PREFIX;
+          return "";
+        }
+        function withPrefix(input) {
+          var prefix = currentPrefix();
+          if (!prefix || typeof input !== "string" || !input) return input;
+          if (input.charAt(0) === "/" && input.charAt(1) !== "/") {
+            var hashAt = input.indexOf("#");
+            var before = hashAt >= 0 ? input.slice(0, hashAt) : input;
+            var hash = hashAt >= 0 ? input.slice(hashAt) : "";
+            var path = before.split("?")[0];
+            if (path === prefix || path.indexOf(prefix + "/") === 0) return input;
+            return prefix + before + hash;
+          }
+          if (/^(https?|wss?):\/\//i.test(input)) {
+            try {
+              var url = new URL(input);
+              if (url.origin !== location.origin) return input;
+              if (url.pathname === prefix || url.pathname.indexOf(prefix + "/") === 0) {
+                return input;
+              }
+              url.pathname = prefix + url.pathname;
+              return url.toString();
+            } catch (e) {
+              return input;
+            }
+          }
+          return input;
+        }
+        var xhrOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (method, url, async, username, password) {
+          var next = typeof url === "string" ? withPrefix(url) : url;
+          return xhrOpen.call(this, method, next, async !== false, username, password);
+        };
+        if (typeof window.fetch === "function") {
+          var nativeFetch = window.fetch.bind(window);
+          window.fetch = function (input, init) {
+            if (typeof input === "string") return nativeFetch(withPrefix(input), init);
+            if (typeof Request !== "undefined" && input instanceof Request) {
+              var next = withPrefix(input.url);
+              if (next !== input.url) input = new Request(next, input);
+            }
+            return nativeFetch(input, init);
+          };
+        }
+        var NativeWebSocket = window.WebSocket;
+        function PrefixedWebSocket(url, protocols) {
+          var next = typeof url === "string" ? withPrefix(url) : url;
+          if (protocols === undefined) return new NativeWebSocket(next);
+          return new NativeWebSocket(next, protocols);
+        }
+        PrefixedWebSocket.prototype = NativeWebSocket.prototype;
+        Object.setPrototypeOf(PrefixedWebSocket, NativeWebSocket);
+        window.WebSocket = PrefixedWebSocket;
+      })();
+    </script>
   </head>
 
   <body>

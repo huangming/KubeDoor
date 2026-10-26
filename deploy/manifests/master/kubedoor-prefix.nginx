@@ -8,6 +8,8 @@ map $request_uri $kd_prefix {
 
 # ---SERVER---
 location = /kubedoor {
+    # 控制端在容器里听 80,外面是 NodePort。关绝对跳转,浏览器才会保住原来的端口。
+    absolute_redirect off;
     return 301 /kubedoor/;
 }
 
@@ -36,6 +38,7 @@ location ^~ /kubedoor/grafana/ {
     proxy_pass http://kubedoor-dash.__NAMESPACE__:3000/grafana/;
 }
 location @kd_login_prefixed {
+    absolute_redirect off;
     return 302 /kubedoor/#/login?redirect=$request_uri;
 }
 # END-GRAFANA
