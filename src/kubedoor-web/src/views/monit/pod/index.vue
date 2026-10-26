@@ -739,6 +739,7 @@ import { useClusterPermission } from "@/utils/permission";
 import { openPodShell } from "@/utils/podShell";
 import { podQuestion } from "@/utils/ai";
 import { useAskAI } from "@/utils/useAskAI";
+import { withPrefix } from "@/prefix/path";
 import PodLogViewer from "@/views/monit/components/PodLogViewer.vue";
 import * as monaco from "monaco-editor";
 import * as yaml from "js-yaml";
@@ -871,7 +872,7 @@ const handleViewEvents = (pod: PodItem) => {
     kind: "Pod",
     name: pod.name
   });
-  window.open(`/#/alarm/events?${params.toString()}`, "_blank");
+  window.open(withPrefix(`/#/alarm/events?${params.toString()}`), "_blank");
 };
 
 const handleViewAlarmDetail = (pod: PodItem) => {
@@ -886,7 +887,7 @@ const handleViewAlarmDetail = (pod: PodItem) => {
     namespace: pod.namespace,
     pod: pod.name
   });
-  window.open(`/#/alarm/detail?${params.toString()}`, "_blank");
+  window.open(withPrefix(`/#/alarm/detail?${params.toString()}`), "_blank");
 };
 
 const formatCreationTime = (timestamp: string | null) => {

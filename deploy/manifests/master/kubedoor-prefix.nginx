@@ -1,0 +1,48 @@
+# /kubedoor/ 是额外入口,原来的 /、/api、/ws、/grafana 不变。
+# $request_uri 在 rewrite last 之后仍是浏览器原始路径,所以前缀能带到后面的 location。
+# 不要在 server 里 set $kd_prefix:内部跳转会重跑 server 段,把值清掉。
+map $request_uri $kd_prefix {
+    default "";
+    ~^/kubedoor([/?]|$) /kubedoor;
+}
+
+# ---SERVER---
+location = /kubedoor {
+    # 控制端在容器里听 80,外面是 NodePort。关绝对跳转,浏览器才会保住原来的端口。
+    absolute_redirect off;
+    return 301 /kubedoor/;
+}
+
+# BEGIN-GRAFANA
+# Grafana 的 root_url 仍是 /grafana/。这里单独反代,并改写它生成的绝对地址。
+location ^~ /kubedoor/grafana/ {
+    auth_request /_kd_auth/grafana;
+    error_page 401 = @kd_login_prefixed;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_set_header Host $host;
+    proxy_set_header X-WEBAUTH-USER $kd_user;
+    proxy_set_header X-WEBAUTH-ROLE $kd_grafana_role;
+    proxy_set_header Accept-Encoding "";
+    proxy_buffer_size 128k;
+    proxy_buffers 8 128k;
+    proxy_busy_buffers_size 256k;
+    proxy_redirect ~*^https?://[^/]+/grafana/(.*) /kubedoor/grafana/$1;
+    proxy_redirect ~^/grafana/(.*) /kubedoor/grafana/$1;
+    sub_filter_once off;
+    sub_filter_types text/html application/javascript text/css application/json;
+    sub_filter '/grafana/' '/kubedoor/grafana/';
+    sub_filter '"/grafana"' '"/kubedoor/grafana"';
+    sub_filter "'/grafana'" "'/kubedoor/grafana'";
+    proxy_pass http://kubedoor-dash.__NAMESPACE__:3000/grafana/;
+}
+location @kd_login_prefixed {
+    absolute_redirect off;
+    return 302 /kubedoor/#/login?redirect=$request_uri;
+}
+# END-GRAFANA
+
+location ^~ /kubedoor/ {
+    rewrite ^/kubedoor/(.*)$ /$1 last;
+}

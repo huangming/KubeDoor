@@ -412,6 +412,18 @@ build_master_vars() {
     fi
     VARS[GRAFANA_DASH_SOURCES]="$(indent_block '              ' "${src%$'\n'}")"
 
+    # /kubedoor/ 入口的 nginx 片段。map 放在 http 段,location 放在 server 段。
+    local prefix_file="$MANIFEST_DIR/master/kubedoor-prefix.nginx"
+    [[ -f "$prefix_file" ]] || die "找不到 $prefix_file"
+    local prefix_raw prefix_map prefix_server
+    prefix_raw="$(cat "$prefix_file")"
+    prefix_raw="${prefix_raw//__NAMESPACE__/${NAMESPACE}}"
+    prefix_map="${prefix_raw%%$'\n# ---SERVER---'*}"
+    prefix_server="${prefix_raw#*$'\n# ---SERVER---'$'\n'}"
+    [[ "$prefix_map" != "$prefix_raw" && -n "$prefix_server" ]] || die "$prefix_file 缺少 # ---SERVER---"
+    VARS[KUBEDOOR_PREFIX_MAP]="$(indent_block '        ' "$prefix_map")"
+    VARS[KUBEDOOR_PREFIX]="$(indent_block '            ' "$prefix_server")"
+
     # 配置摘要,写进 Pod 模板的 checksum/config 注解:配置变了,重跑安装脚本时对应组件自动滚动更新。
     # subPath 挂载的配置文件不会随 ConfigMap 更新,envFrom 的环境变量和启动时加载的告警规则也要重启才生效。
     # 必须放在最后算:用到的占位符都要先有值

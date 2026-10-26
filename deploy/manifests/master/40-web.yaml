@@ -69,6 +69,8 @@ data:
             ''      close;
         }
 
+        __KUBEDOOR_PREFIX_MAP__
+
         upstream kubedoor_master { server kubedoor-master.__NAMESPACE__:80; }
 
         server {
@@ -81,6 +83,8 @@ data:
             auth_request_set $kd_role         $upstream_http_x_kubedoor_role;
             auth_request_set $kd_clusters     $upstream_http_x_kubedoor_clusters;
             auth_request_set $kd_grafana_role $upstream_http_x_kubedoor_grafana_role;
+
+            __KUBEDOOR_PREFIX__
 
             # ---------- 静态页面(前端是 hash 路由,不需要 try_files;登录页不需要认证) ----------
             location / {
@@ -98,6 +102,8 @@ data:
                 proxy_set_header X-Forwarded-Proto $scheme;
                 # 外部请求不能带内部 token 冒充集群内的服务
                 proxy_set_header X-Kubedoor-Token "";
+                # 从 /kubedoor/ 进来时是 /kubedoor,直接访问时为空。master 用它决定会话 Cookie 的 Path
+                proxy_set_header X-Forwarded-Prefix $kd_prefix;
                 proxy_read_timeout 3600;
                 proxy_pass http://kubedoor_master;
             }

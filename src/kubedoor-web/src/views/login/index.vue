@@ -13,6 +13,7 @@ import { useRenderIcon } from "@/components/ReIcon/src/hooks";
 import { ref, reactive, watch, onMounted, onBeforeUnmount } from "vue";
 import { useTranslationLang } from "@/layout/hooks/useTranslationLang";
 import { useDataThemeChange } from "@/layout/hooks/useDataThemeChange";
+import { WEB_PREFIX, withPrefix } from "@/prefix/path";
 
 import dayIcon from "@/assets/svg/day.svg?component";
 import darkIcon from "@/assets/svg/dark.svg?component";
@@ -61,8 +62,8 @@ const rules: FormRules = {
 async function goAfterLogin() {
   const redirect =
     typeof route.query.redirect === "string" ? route.query.redirect : "";
-  if (redirect.startsWith("/grafana/")) {
-    window.location.href = redirect;
+  if (redirect.startsWith("/grafana/") || redirect.startsWith(`${WEB_PREFIX}/grafana/`)) {
+    window.location.href = withPrefix(redirect);
     return;
   }
   await initRouter();
